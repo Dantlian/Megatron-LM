@@ -121,11 +121,11 @@ def finalize_model_grads(model: List[torch.nn.Module]):
     if config.timers is not None:
         config.timers('layernorm-grads-all-reduce').stop()
 
-    # All-reduce embedding grads (for pipeline parallelism).
-    if config.timers is not None:
-        config.timers('embedding-grads-all-reduce', log_level=1).start(
-            barrier=config.barrier_with_L1_time
-        )
-    _allreduce_embedding_grads(model, config)
-    if config.timers is not None:
-        config.timers('embedding-grads-all-reduce').stop()
+    # # All-reduce embedding grads (for pipeline parallelism).
+    # if config.timers is not None:
+    #     config.timers('embedding-grads-all-reduce', log_level=1).start(
+    #         barrier=config.barrier_with_L1_time
+    #     )
+    # _allreduce_embedding_grads(model, config)
+    # if config.timers is not None:
+    #     config.timers('embedding-grads-all-reduce').stop()

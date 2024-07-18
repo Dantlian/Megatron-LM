@@ -10,6 +10,7 @@ import logging
 import os
 import sys
 from .log_handler import CustomHandler
+import subprocess
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 from .theoretical_memory_usage import report_theoretical_memory
@@ -20,6 +21,7 @@ import torch
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import get_model_config
+from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.legacy.model import Float16Module
@@ -249,6 +251,7 @@ def pretrain(train_valid_test_dataset_provider,
         train_data_iterator, valid_data_iterator, test_data_iterator \
             = build_train_valid_test_data_iterators(
                 train_valid_test_dataset_provider)
+
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
 
@@ -351,6 +354,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             )
             this_model.model_type = model_type
             model.append(this_model)
+            tmp_model_dict = this_model.state_dict()
+            print("6666666")
     else:
         pre_process = mpu.is_pipeline_first_stage()
         post_process = mpu.is_pipeline_last_stage()
@@ -409,7 +414,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         model = [Float16Module(model_module, args) for model_module in model]
 
     if wrap_with_ddp:
-        config = get_model_config(model[0])
+        # config = get_model_config(model[0])
+        try:
+            config = get_model_config(model[0])
+        except:
+            config = core_transformer_config_from_args(args)
         model = [DDP(config,
                      model_chunk,
                      data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
@@ -501,6 +510,7 @@ def setup_model_and_optimizer(model_provider_func,
     config.timers = timers
     optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
                                        scale_lr_cond, lr_mult)
+
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     if args.load is not None or args.pretrained_checkpoint is not None:
@@ -523,6 +533,28 @@ def setup_model_and_optimizer(model_provider_func,
 
     return model, optimizer, opt_param_scheduler
 
+@torch.no_grad()
+def update_ema(
+        ema_model: torch.nn.Module, model: torch.nn.Module, optimizer=None, decay: float = 0.9999, sharded: bool = False
+) -> None:
+    """
+    Step the EMA model towards the current model.
+    """
+    from collections import OrderedDict
+    ema_params = OrderedDict(ema_model.named_parameters())
+    model_params = OrderedDict(model.named_parameters())
+
+    for name, param in model_params.items():
+        if name == "pos_embed":
+            continue
+        if param.requires_grad == False:
+            continue
+        if not sharded:
+            param_data = param.data
+            ema_params[name].mul_(decay).add_(param_data, alpha=1 - decay)
+        else:
+            param_data = param.data
+            ema_params[name].mul_(decay).add_(param_data, alpha=1 - decay)
 
 
 def train_step(forward_step_func, data_iterator,
@@ -559,8 +591,45 @@ def train_step(forward_step_func, data_iterator,
 
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+
+    # total_param = 0
+    # for param_group in optimizer.param_groups:
+    #     for param in param_group['params']:
+    #         # 确保参数有梯度
+    #         if param.data is not None:
+    #             # 将梯度的和累加
+    #             total_param += torch.sum(param.data)
+    # print("\nbefore__total_param_dataaaa:",total_param)
+
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
+
+    # for model_chunk in model:
+    #     # if dataParallel:
+    #     if True:
+    #         update_ema(model_chunk.module.module.ema, model_chunk.module.module, optimizer=optimizer)
+    #     else:
+    #         update_ema(model_chunk.module.ema, model_chunk.module, optimizer=optimizer)
+
+
+    
+    total_grad = 0
+    for param_group in optimizer.param_groups:
+        for param in param_group['params']:
+            # 确保参数有梯度
+            if param.grad is not None:
+                # 将梯度的和累加
+                total_grad += torch.sum(param.grad)
+    print("\ntotal_graddd1111111:",total_grad)
+    
+    total_param = 0
+    for param_group in optimizer.param_groups:
+        for param in param_group['params']:
+            # 确保参数有梯度
+            if param.data is not None:
+                # 将梯度的和累加
+                total_param += torch.sum(param.data)
+    print("\ntotal_param_dataaaa:",total_param)
 
     # Vision momentum.
     if getattr(args, 'vision_pretraining', False) and args.vision_pretraining_type == "dino":
@@ -994,6 +1063,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        opt_param_scheduler,
                        config)
         iteration += 1
+        if iteration == 3 and torch.distributed.get_rank() == 0:
+            print(" Memory Usage: ", subprocess.run("npu-smi info |grep 65536|head -n 1",shell=True,stdout=subprocess.PIPE,text=True).stdout.split()[-3][:-1])
         batch_size = mpu.get_data_parallel_world_size() * \
                      args.micro_batch_size * \
                      get_num_microbatches()
