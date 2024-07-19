@@ -263,9 +263,23 @@ def model_provider(pre_process=True, post_process=True):
 
     stdit.load_state_dict(partial_state_dict, strict=False)
 
-    ema = deepcopy(stdit)
+    # create ema
+    model_state_dict = stdit.state_dict()
+    ema = build_module(
+        cfg['model'],
+        MODELS,
+        input_size=latent_size,
+        in_channels=vae.out_channels,
+        caption_channels=text_encoder.output_dim,
+        model_max_length=text_encoder.model_max_length,
+        dtype=dtype,
+    )
+    ema.load_state_dict(model_state_dict)
+    ema = ema.to(torch.float32).to(torch.cuda.current_device())
+    stdit = stdit.to(torch.cuda.current_device(), dtype)
     requires_grad(ema, False)
     stdit.ema = ema
+    stdit.train()
     update_ema(ema, stdit, decay=0, sharded=False)
     ema.eval()
     # model_sharding(ema)

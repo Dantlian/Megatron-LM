@@ -31,11 +31,6 @@ DISTRIBUTED_ARGS="
     #         --num-layers-per-virtual-pipeline-stage 1 \
 
 GPT_ARGS="
-    --netmind-path /home/l00618052/netmind3.8/output/install/lib \
-    --netmind-mode aaa \
-    --netmind-weight tp_1,sp_2,ep_3,cp_4,dp_5,pp_6 \
-    --netmind-comm-amount tp_1,sp_2,ep_3,cp_4,dp_5,pp_6 \
-    --netmind-qos tp_1,sp_2,ep_3,cp_4,dp_5,pp_6 \
     --tensor-model-parallel-size ${TP} \
     --pipeline-model-parallel-size ${PP} \
     --context-parallel-size ${CP} \

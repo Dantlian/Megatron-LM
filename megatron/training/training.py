@@ -602,32 +602,6 @@ def train_step(forward_step_func, data_iterator,
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
 
-    # for model_chunk in model:
-    #     # if dataParallel:
-    #     if True:
-    #         update_ema(model_chunk.module.module.ema, model_chunk.module.module, optimizer=optimizer)
-    #     else:
-    #         update_ema(model_chunk.module.ema, model_chunk.module, optimizer=optimizer)
-
-
-    
-    total_grad = 0
-    for param_group in optimizer.param_groups:
-        for param in param_group['params']:
-            # 确保参数有梯度
-            if param.grad is not None:
-                # 将梯度的和累加
-                total_grad += torch.sum(param.grad)
-    print("\ntotal_graddd1111111:",total_grad)
-    
-    total_param = 0
-    for param_group in optimizer.param_groups:
-        for param in param_group['params']:
-            # 确保参数有梯度
-            if param.data is not None:
-                # 将梯度的和累加
-                total_param += torch.sum(param.data)
-    print("\ntotal_param_dataaaa:",total_param)
 
     # Vision momentum.
     if getattr(args, 'vision_pretraining', False) and args.vision_pretraining_type == "dino":
