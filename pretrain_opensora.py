@@ -1,39 +1,32 @@
 # Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 
 """Pretrain VIT"""
-
+import copy
 import torch
-import torch.nn as nn
-import numpy as np
 from copy import deepcopy
 from functools import partial
 
 import mindspeed.megatron_adaptor
-from megatron.training import get_args, get_timers, print_rank_0
+import mindspeed
+from megatron import core
+from megatron.training import get_args
 from megatron.core.enums import ModelType
 from megatron.core import mpu
-from megatron.legacy.data.vit_dataset import build_train_valid_datasets
 from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
-from megatron.training.arguments import core_transformer_config_from_args
-from opensora.acceleration.parallel_states import get_data_parallel_group
-from opensora.schedulers.iddpm.diffusion_utils import continuous_gaussian_log_likelihood
-
-from opensora.utils.config_utils import parse_configs, merge_args
-from opensora.utils.train_utils import  update_ema
-from opensora.utils.misc import to_torch_dtype,requires_grad
-
-from mindspeed.utils import get_batch_on_this_cp_rank
+from opensora.utils.misc import to_torch_dtype, requires_grad
 from opensora.datasets import DatasetFromCSV, get_transforms_video, get_transforms_image, prepare_dataloader
 from opensora.registry import MODELS, SCHEDULERS, build_module
-# from opensora.utils.ckpt_utils import model_sharding
-
+from opensora.utils.train_utils import update_ema
 from mmengine.config import Config
 
 scheduler = None
 vae = None
 text_encoder = None
 cfg = {}
+
+
+cp_param_name = 'pos_embed_temporal'
 
 
 def initialize():
@@ -44,11 +37,11 @@ def initialize():
 
         vae_cfg = cfg['vae']
         text_encoder_cfg = cfg['text_encoder']
-        if  mpu.get_tensor_model_parallel_rank() == 0:
+        if mpu.get_tensor_model_parallel_rank() == 0:
             vae = build_module(vae_cfg, MODELS)
             text_encoder = build_module(text_encoder_cfg, MODELS, device=torch.cuda.current_device())
         torch.distributed.barrier()
-        if  mpu.get_tensor_model_parallel_rank() != 0:
+        if mpu.get_tensor_model_parallel_rank() != 0:
             vae = build_module(vae_cfg, MODELS)
             text_encoder = build_module(text_encoder_cfg, MODELS, device=torch.cuda.current_device())
 
@@ -76,10 +69,10 @@ def initialize():
         cfg['num_workers'] = config.num_workers
         cfg['root'] = config.root
         cfg['use_image_transform'] = config.use_image_transform
-        cfg['input_size'] = (cfg['num_frames'], *cfg['image_size'])  
+        cfg['input_size'] = (cfg['num_frames'], *cfg['image_size'])
         cfg['micro_batch_size'] = args.micro_batch_size
-        
-        print("cfg:",cfg)
+
+        print("cfg:", cfg)
 
     initialize_config()
     initialize_scheduler()
@@ -92,12 +85,12 @@ def initialize_pipeline_tensor_shaped(hidden_size):
     text_encoder_maxlen = text_encoder.model_max_length
 
     setattr(forward_step, 'pipeline_tensor_shapes',
-        [(micro_batch_size, text_encoder.output_dim, hidden_size),(micro_batch_size, vae.out_channels, *latent_size),
-        (micro_batch_size, 1, text_encoder_maxlen, hidden_size), (micro_batch_size),
-        (micro_batch_size, hidden_size * 6), (micro_batch_size, text_encoder_maxlen),
-        (micro_batch_size, vae.out_channels, *latent_size),
-         (micro_batch_size, vae.out_channels, *latent_size)
-         ,(2, 1152)])
+            [(micro_batch_size, text_encoder.output_dim, hidden_size),
+             (micro_batch_size, vae.out_channels, *latent_size),
+             (micro_batch_size, 1, text_encoder_maxlen, hidden_size), (micro_batch_size),
+             (micro_batch_size, hidden_size * 6), (micro_batch_size, text_encoder_maxlen),
+             (micro_batch_size, vae.out_channels, *latent_size), (micro_batch_size, vae.out_channels, *latent_size),
+             (micro_batch_size, hidden_size)])
 
 
 def model_sharding(model: torch.nn.Module):
@@ -115,11 +108,57 @@ def model_sharding(model: torch.nn.Module):
 
 rank_list= []
 def model_provider(pre_process=True, post_process=True):
-    """Build the model."""
+    args = get_args()
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    cp_size = mpu.get_context_parallel_world_size()
+
+    def get_partial_state_dict(init_state_dict, load_state_dict):
+        _partial_state_dict = copy.deepcopy(load_state_dict)
+        for name, param in init_state_dict.items():
+            if name not in load_state_dict:
+                assert "name not in load_state_dict"
+            if not isinstance(load_state_dict.get(name), torch.Tensor):
+                continue
+            load_shape = list(load_state_dict.get(name).shape)
+            init_shape = list(param.shape)
+            seq_dim = 1
+            if cp_size > 1 and cp_param_name in name and init_shape[seq_dim] * cp_size == load_shape[seq_dim]:
+                _partial_state_dict[name] = torch.chunk(load_state_dict.get(name), cp_size, dim=seq_dim)[
+                    mpu.get_context_parallel_rank()]
+                # update load_state_dict and load_shape
+                load_state_dict[name] = _partial_state_dict[name]
+                load_shape = list(load_state_dict.get(name).shape)
+
+            for i in range(len(init_shape)):
+                if tp_size > 1 and init_shape[i] * tp_size == load_shape[i]:
+                    _partial_state_dict[name] = torch.chunk(load_state_dict.get(name), tp_size, dim=i)[
+                        mpu.get_tensor_model_parallel_rank()]
+                    break
+
+        return _partial_state_dict
+
+    def get_partial_tensor(load_param_name, load_param, init_param, seq_dim=1):
+        if not isinstance(load_param, torch.Tensor) or not isinstance(init_param, torch.Tensor):
+            return load_param
+        load_shape = list(load_param.shape)
+        init_shape = list(init_param.shape)
+        _partial_param = load_param
+        if cp_size > 1 and cp_param_name in load_param_name and init_shape[seq_dim] * cp_size == load_shape[seq_dim]:
+            _partial_param = torch.chunk(load_param, cp_size, dim=seq_dim)[mpu.get_context_parallel_rank()]
+            # update load_param and load_shape
+            load_param = _partial_param
+            load_shape = list(load_param.shape)
+
+        for i in range(len(init_shape)):
+            if tp_size > 1 and init_shape[i] * tp_size == load_shape[i]:
+                _partial_param = torch.chunk(load_param, tp_size, dim=i)[mpu.get_tensor_model_parallel_rank()]
+                break
+        return _partial_param
+
     dtype = to_torch_dtype("bf16")
 
     latent_size = cfg['latent_size']
-    print("latent_size:",latent_size)
+    print("latent_size:", latent_size)
     stdit = build_module(
         cfg['model'],
         MODELS,
@@ -133,63 +172,12 @@ def model_provider(pre_process=True, post_process=True):
     # ema = deepcopy(stdit).to(torch.float32).to(torch.cuda.current_device())
     # requires_grad(ema, False)
 
-    state_dict  = torch.load('/home/l00618052/Megatron-LM/my_model_state_dict.pth')
-    
     pp_size = mpu.get_pipeline_model_parallel_world_size()
     vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
-
-
-    hooks = ['final_layer.linear.weight', '']
-
-
-    def print_func(inputs, prefix):
-        if isinstance(inputs, tuple):
-            for i in inputs:
-                print_func(i, prefix)
-        elif isinstance(inputs, torch.Tensor):
-            print(prefix, inputs.shape, inputs.dtype, inputs)
-        else:
-            print(prefix, inputs)
-        
-
-
-    def hook_func(name, module):
-        def hook_function(module, inputs, outputs):
-            pp_rank = mpu.get_pipeline_model_parallel_rank()
-            vpp_rank = mpu.get_virtual_pipeline_model_parallel_rank()
-            if 'blocks' in name:
-                return
-            global rank_list
-            if name + str(pp_rank)+":"+str(vpp_rank) not in rank_list:
-                rank_list.append(name + str(pp_rank)+":"+str(vpp_rank))
-
-                print('================================================')
-                print(module)
-                print_func(inputs, name+' inputs')
-                print_func(outputs, name+' outputs')
-        return hook_function
-
-    #===============预加载模型测试-START=================
+    init_state_dict = stdit.state_dict()
+    load_state_dict = torch.load(args.load)
     if pp_size <= 1:
-        stdit.load_state_dict(state_dict)
-        # def print_grad_info(name):
-        #     def hook(grad):
-        #         if name.startswith('blocks'):
-        #             return
-        #         print(f"Parameter Name: {name}, Shape: {grad.shape},\n Gradient: {grad}\n")
-
-        #     return hook
-
-        # for name, param in stdit.named_parameters():
-        #     if param.requires_grad:
-        #         param.register_hook(print_grad_info(name))
-
-        for name, module in stdit.named_modules():
-            if module is not None:
-                module.register_forward_hook(hook_func('[forward]:' + name, module))
-                module.register_backward_hook(hook_func('[backward]:' + name, module))
-                        
-
+        stdit.load_state_dict(get_partial_state_dict(init_state_dict, load_state_dict))
         return stdit
 
     pp_rank = mpu.get_pipeline_model_parallel_rank()
@@ -252,14 +240,14 @@ def model_provider(pre_process=True, post_process=True):
         pp_blocks = [pp_block_index]
 
     partial_state_dict = {}
-    for name, param in state_dict.items():
+    for name, param in load_state_dict.items():
         if name.startswith('blocks'):
             for i in range(0, len(pp_blocks)):
                 key_parts = name.split(".")
                 if(key_parts[1] == str(pp_blocks[i])):
                     key_parts[1] = str(i)
                     key = '.'.join(key_parts)
-                    partial_state_dict[key] = param
+                    partial_state_dict[key] = get_partial_tensor(name, param, init_state_dict.get(key))
                     break
 
         else:
@@ -267,15 +255,13 @@ def model_provider(pre_process=True, post_process=True):
                 or name.startswith('t_embedder') or name.startswith('t_block') \
                 or name.startswith('y_embedder') or name.startswith('pos_embed'):
                 if mpu.is_pipeline_first_stage():
-                    partial_state_dict[name] = param
+                    partial_state_dict[name] = get_partial_tensor(name, param, init_state_dict.get(name))
 
             if name.startswith('final_layer') or name.startswith('t_embedder') :
                 if mpu.is_pipeline_last_stage():
-                    partial_state_dict[name] = param
-
+                    partial_state_dict[name] = get_partial_tensor(name, param, init_state_dict.get(name))
 
     stdit.load_state_dict(partial_state_dict, strict=False)
-    # torch.save(stdit.state_dict(), 'tmp.pth')
 
     ema = deepcopy(stdit)
     requires_grad(ema, False)
@@ -283,95 +269,8 @@ def model_provider(pre_process=True, post_process=True):
     update_ema(ema, stdit, decay=0, sharded=False)
     ema.eval()
     # model_sharding(ema)
-    new_stdit_state_dict = stdit.state_dict()
-
-    # def print_grad_info(name):
-    #     def hook(grad, inputs, outputs):
-    #         global rank_list
-    #         # print(f"rank_list: {rank_list}\n")
-
-    #         pp_rank = mpu.get_pipeline_model_parallel_rank()
-    #         vpp_rank = mpu.get_virtual_pipeline_model_parallel_rank()
-    #         # if name.startswith('blocks'):
-    #         #     return
-    #         if name + str(pp_rank)+":"+str(vpp_rank) not in rank_list:
-    #             rank_list.append(name + str(pp_rank)+":"+str(vpp_rank))
-    #             print(f"Parameter Name: {name}, Shape: {grad.shape}, pp Rank: {pp_rank}, vpp Rank: {vpp_rank},\n Gradient: {grad}\n Input: {input}\n  Output: {output}\n")
-    #     return hook
-
-    # for name, param in stdit.named_parameters():
-    #     if param.requires_grad:
-    #         param.register_hook(print_grad_info(name))
-
-    # def hook_func(name, module):
-    #     def hook_function(module, inputs, outputs):
-    #         global rank_list
-
-    #         if 'blocks' in name:
-    #             return
-    #         print_inputs = inputs
-    #         print_outputs = outputs
-    #         if name + str(pp_rank)+":"+str(vpp_rank) not in rank_list:
-    #             rank_list.append(name + str(pp_rank)+":"+str(vpp_rank))
-    #         #     if inputs[0] is None:
-    #         #         print_inputs = None
-    #         #     else:
-    #         #         inputs_num_dims = inputs[0].dim()
-    #         #         if inputs_num_dims == 0:
-    #         #             print_inputs = inputs[0]
-    #         #         else:
-    #         #             print_inputs = inputs[0][..., -1]
-
-    #         #     if outputs[0] is None:
-    #         #         print_outputs = None
-    #         #     else:
-    #         #         outputs_num_dims = outputs[0].dim()
-    #         #         if outputs_num_dims == 0:
-    #         #             print_outputs = outputs[0]
-    #         #         else:
-    #         #             print_outputs = outputs[0][..., -1]
-
-    #             print(f"MODULE Parameter Name: {name},  \n inputs: {print_inputs}, \n outputs: {print_outputs}, \n pp Rank: {pp_rank}, vpp Rank: {vpp_rank}\n")
-
-    #             # print(f"MODULE Parameter Name: {name}, \n input.shape:{print_inputs.shape}, \n inputs: {print_inputs}, \n outputs.shape:{print_outputs.shape}, \n outputs: {print_outputs}, \n pp Rank: {pp_rank}, vpp Rank: {vpp_rank}\n")
-    #     return hook_function
 
 
-    # def hook_func(name, module):
-    #     def hook_function(module, grad_input, grad_output):
-    #         global rank_list
-
-    #         # if name.startswith('blocks'):
-    #         #     return
-    #         if name + str(pp_rank)+":"+str(vpp_rank) not in rank_list:
-    #             rank_list.append(name + str(pp_rank)+":"+str(vpp_rank))
-    #             if grad_input[0] is None:
-    #                 print_inputs = None
-    #             else:
-    #                 inputs_num_dims = grad_input[0].dim()
-    #                 if inputs_num_dims == 0:
-    #                     print_inputs = grad_input[0]
-    #                 else:
-    #                     print_inputs = grad_input[0][..., -1]
-
-    #             if grad_output[0] is None:
-    #                 print_outputs = None
-    #             else:
-    #                 outputs_num_dims = grad_output[0].dim()
-    #                 if outputs_num_dims == 0:
-    #                     print_outputs = grad_output[0]
-    #                 else:
-    #                     print_outputs = grad_output[0][..., -1]
-
-    #             print(f"MODULE Parameter Name: {name}, \n inputs: {print_inputs}, \n outputs: {print_outputs}, \n pp Rank: {pp_rank}, vpp Rank: {vpp_rank}\n")
-    #     return hook_function
-
-
-    # for name, module in stdit.named_modules():
-    #     if module is not None:
-    #         module.register_forward_hook(hook_func('[forward]:' + name, module))
-    #         module.register_backward_hook(hook_func('[backward]:' + name, module))
-                    
   #===============预加载模型测试-END=================
     initialize_pipeline_tensor_shaped(stdit.hidden_size)
     return stdit
@@ -390,62 +289,109 @@ def get_batch_on_this_tp_rank(data_iterator):
 
     dtype = to_torch_dtype("bf16")
 
-    if mpu.get_tensor_model_parallel_rank() == 0:
+    def _preprocessing_without_dp():
+        if mpu.get_tensor_model_parallel_rank() == 0:
+            if data_iterator is not None:
+                batch = next(data_iterator)
+            else:
+                batch = None
+            x = batch['video'].to(torch.cuda.current_device(), dtype)
+            # x.shape: [4, 3, 16, 256, 256], [B, C, T, H/P, W/P]
+            y = batch['text']
+
+            with torch.no_grad():
+                # Prepare visual inputs
+                # before vae.encode, x.shape: [4, 3, 16, 256, 256], [B, C, T, H/P, W/P]
+                x = vae.encode(x).contiguous()
+                # after vae.encode, x.shape: [4, 4, 16, 32, 32]
+                # Prepare text inputs
+                encoded_text = text_encoder.encode(y)
+
+            y = encoded_text['y'].contiguous()
+            # y.shape: [4, 1, 120, 4096]
+            mask = encoded_text['mask'].contiguous()
+            # mask.shape: [4, 120]
+
+            _broadcast(x)
+            _broadcast(y)
+            _broadcast(mask)
+
+        else:
+            latent_size = cfg['latent_size']
+            micro_batch_size = cfg['micro_batch_size']
+
+            text_encoder_maxlen = text_encoder.model_max_length
+            text_encoder_output_dim = text_encoder.output_dim
+
+            x = torch.empty((micro_batch_size, vae.out_channels, *latent_size),
+                            dtype=dtype, device=torch.cuda.current_device())
+            y = torch.empty((micro_batch_size, 1, text_encoder_maxlen, text_encoder_output_dim), dtype=torch.float32,
+                            device=torch.cuda.current_device())
+            mask = torch.empty((micro_batch_size, text_encoder_maxlen), dtype=torch.int64,
+                               device=torch.cuda.current_device())
+
+            _broadcast(x)
+            _broadcast(y)
+            _broadcast(mask)
+
+        return {
+            'x': x,
+            'y': y,
+            'mask': mask
+        }
+
+    def _preprocessing_with_dp():
+        tp_cp_size = mindspeed.core.parallel_state.get_tensor_and_context_parallel_world_size()
+        tp_cp_rank = mindspeed.core.parallel_state.get_tensor_and_context_parallel_rank()
+
         if data_iterator is not None:
             batch = next(data_iterator)
         else:
             batch = None
         x = batch['video'].to(torch.cuda.current_device(), dtype)
+        # x.shape: [4, 3, 16, 256, 256], [B, C, T, H/P, W/P]
         y = batch['text']
+        frame_dim = 2
+        num_frames = x.shape[frame_dim]
+        frames_per_partition = core.utils.divide(num_frames, tp_cp_size)
+        start_frame = tp_cp_rank * frames_per_partition
+        end_frame = min(start_frame + frames_per_partition, num_frames)
+        x_per_partition = x[:, :, start_frame:end_frame].contiguous()
 
         with torch.no_grad():
-            # Prepare visual inputs
-            x = vae.encode(x).contiguous()  # [B, C, T, H/P, W/P]  #[2, 4, 16, 32, 32]
-            # Prepare text inputs
+            x_per_partition = vae.encode(x_per_partition).contiguous()
             encoded_text = text_encoder.encode(y)
-
         y = encoded_text['y'].contiguous()
+        # y.shape: [4, 1, 120, 4096]
         mask = encoded_text['mask'].contiguous()
+        # mask.shape: [4, 120]
 
+        # Gather results from all GPUs
+        gathered_latents_list = [torch.zeros_like(x_per_partition) for _ in range(tp_cp_size)]
+        torch.distributed.all_gather(gathered_latents_list, x_per_partition,
+                                     group=mindspeed.core.parallel_state.get_tensor_and_context_parallel_group())
 
-        _broadcast(x)
-        _broadcast(y)
-        _broadcast(mask)
+        x = torch.cat(gathered_latents_list, dim=frame_dim).contiguous()
+        # x.shape:torch.Size([4, 4, 16, 32, 32])
+        return {
+            'x': x,
+            'y': y,
+            'mask': mask
+        }
 
+    if (args.enable_preprocessing_data_parallelism and
+            cfg.get('num_frames') % mindspeed.core.parallel_state.get_tensor_and_context_parallel_world_size() == 0):
+        batch = _preprocessing_with_dp()
     else:
-        latent_size = cfg['latent_size']
-        micro_batch_size = cfg['micro_batch_size']
-
-        text_encoder_maxlen = text_encoder.model_max_length
-        text_encoder_output_dim = text_encoder.output_dim
-
-        x = torch.empty((micro_batch_size, vae.out_channels, *latent_size),
-                             dtype=dtype, device=torch.cuda.current_device())
-        y = torch.empty((micro_batch_size, 1, text_encoder_maxlen, text_encoder_output_dim), dtype=torch.float32, device=torch.cuda.current_device())
-        mask = torch.empty((micro_batch_size, text_encoder_maxlen), dtype=torch.int64, device=torch.cuda.current_device())
-
-        _broadcast(x)
-        _broadcast(y)
-        _broadcast(mask)
-
-    batch = {
-        'x': x,
-        'y': y,
-        'mask': mask
-    }
+        batch = _preprocessing_without_dp()
     return batch
 
 
 def get_batch(data_iterator):
     """Build the batch."""
-    # cfg = parse_configs(training=True)
-    device = torch.cuda.current_device()
-    # dtype = to_torch_dtype(cfg.dtype)
-    dtype = to_torch_dtype("bf16")
 
-    if (mpu.is_pipeline_first_stage()):# or mpu.is_pipeline_last_stage()):
+    if mpu.is_pipeline_first_stage():
         batch = get_batch_on_this_tp_rank(data_iterator)
-        batch =  get_batch_on_this_cp_rank(batch)
         return batch['x'], batch['y'], batch['mask']
     else:
         return None, None, None
@@ -453,33 +399,15 @@ def get_batch(data_iterator):
 
 def loss_func(x_t, x_0, t, noise, output_tensor):
     loss_dict = scheduler.training_losses(output_tensor, x_t, x_0, t, noise = noise)
-
-    loss1 = float(loss_dict["loss"][0])
-    loss2 = float(loss_dict["loss"][1])
-    # loss3 = float(loss_dict["loss"][2])
-    # loss4 = float(loss_dict["loss"][3])
-    print("loss_dict:",[loss1,loss2], "\n")
-
-
     loss = loss_dict["loss"].mean()
-
-    print("losss:",float(loss), "\n")
-    print(" output_tensor[0][0]:",output_tensor[0][0][0][0][0],"\n")
-    print(" x_t[0][0]:",x_t[0][0][0][0][0],"\n")
-    print(" x_0[0][0]:",x_0[0][0][0][0][0],"\n")
-    print(" noise[0][0]:",noise[0][0][0][0][0],"\n")
-    # print(" ttt:",t,"\n")
-    # print(" yyy:",y,"\n")
-    # print(" t0t0t0:",t0,"\n")
-
 
     averaged_loss = average_losses_across_data_parallel_group([loss])
 
     loss = loss.unsqueeze(0)
-    print(" averaged loss:",averaged_loss[0],"\n")
     return loss, {"loss": averaged_loss[0]}
 
 iter_index = 0
+
 
 def forward_step(data_iterator, model):
     """Forward step."""
@@ -491,44 +419,34 @@ def forward_step(data_iterator, model):
     num_timesteps = 1000
     micro_bs = args.micro_batch_size
     dtype = to_torch_dtype("bf16")
-    # t = torch.randint(0, num_timesteps, (micro_bs,),device=torch.cuda.current_device(), dtype = dtype)
-    # t = torch.clamp(t, 0, num_timesteps-1)
-
-    dp_size = mpu.get_data_parallel_world_size()
 
     global iter_index
     if mpu.is_pipeline_first_stage():
         iter_index = iter_index + 1
 
-    # x_t = None
     timestep = None
     x_0 = None
     noise = None
 
-    pp_size = mpu.get_pipeline_model_parallel_world_size()
-
     if mpu.is_pipeline_first_stage():
         torch.manual_seed(1234)
         for i in range(0, iter_index):
-            timestep = torch.randint(0, num_timesteps, (micro_bs,),device=torch.cuda.current_device(), dtype = torch.int64)
-        # print("timestep_old_000:",timestep)
-        timestep = torch.clamp(timestep, 0, num_timesteps-3)
-        timestep = timestep.to(dtype = torch.float16)
-        print("timestep_old_111:",timestep)
+            timestep = torch.randint(0, num_timesteps, (micro_bs,), device=torch.cuda.current_device(),
+                                     dtype=torch.int64)
+        timestep = torch.clamp(timestep, 0, num_timesteps - 3)
+        timestep = timestep.to(dtype=torch.float16)
         torch.manual_seed(1234)
 
-
         x_0 = x.clone()
-        # noise = torch.randn_like(x)
 
-        ########精度对齐使用##########
+        ######## 精度对齐使用##########
         torch.manual_seed(1234)
         for i in range(0, iter_index):
             noise = torch.randn_like(x)
         torch.manual_seed(1234)
         ###############################
 
-        noise = noise.to(device=torch.cuda.current_device(), dtype = dtype)
+        noise = noise.to(device=torch.cuda.current_device(), dtype=dtype)
         torch.manual_seed(1234)
         x = scheduler.q_sample(x, timestep, noise=noise)
         torch.manual_seed(1234)
@@ -541,16 +459,6 @@ def forward_step(data_iterator, model):
         x = model(x, timestep, y, x_0, noise, mask)
         output_tensor_wrap = [x]
 
-    # timestep = timestep.to(torch.int64)
-    # print(" x[0][0]:",x[0][0][0],"\n")
-    # print(" x_t[0][0]:",x_t[0][0][0],"\n")
-    # print(" x_0[0][0]:",x_0[0][0][0],"\n")
-    # print(" noise[0][0]:",noise[0][0][0],"\n")
-    # print(" timestep:",timestep,"\n")
-    # print(" yyy:",y,"\n")
-    # print(" t0t0t0:",t0,"\n")
-    
-
     return output_tensor_wrap, partial(loss_func, x_t, x_0, timestep, noise)
 
 
@@ -558,7 +466,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
     args = get_args()
 
-    print("args.data_path:",args.data_path[0])
+    print("args.data_path:", args.data_path[0])
     dataset = DatasetFromCSV(
         args.data_path[0],
         transform=(
@@ -581,9 +489,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         process_group=mpu.get_data_parallel_group(),
     )
     dataloader.sampler.set_start_index(0)
-    # dataloader.sampler.set_start_index(sampler_start_idx)
-    # dataloader.sampler.set_epoch(epoch)
-    # dataloader_iter = iter(dataloader)
 
     return iter(dataloader), None, None
 
@@ -597,5 +502,5 @@ if __name__ == "__main__":
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'dataloader_type': 'external',
-            'init_func': initialize}
+                       'init_func': initialize}
     )

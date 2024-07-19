@@ -2,8 +2,8 @@ source "/home/l00618052/AscendSpeed/tests_extend/system_tests/env_npu.sh"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-GPUS_PER_NODE=1
-MASTER_ADDR=90.90.94.184
+GPUS_PER_NODE=8
+MASTER_ADDR=localhost
 MASTER_PORT=6900
 NNODES=1
 NODE_RANK=0
@@ -16,8 +16,10 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 #     --master-port 61883 \
 # "
 
-TP=1
-PP=1
+TP=2
+PP=2
+CP=2
+PreProcDP=False
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
@@ -36,16 +38,17 @@ GPT_ARGS="
     --netmind-qos tp_1,sp_2,ep_3,cp_4,dp_5,pp_6 \
     --tensor-model-parallel-size ${TP} \
     --pipeline-model-parallel-size ${PP} \
+    --context-parallel-size ${CP} \
+    --context-parallel-algo ulysses_cp_algo \
+    --enable-preprocessing-data-parallelism ${PreProcDP} \
 
     --micro-batch-size 4 \
     --global-batch-size 4 \
     --num-layers 12 \
-    --hidden-size 4096 \
-    --ffn-hidden-size 14336 \
-    --num-attention-heads 32 \
+    --hidden-size 1152 \
+    --num-attention-heads 16 \
     --seq-length 1024\
     --max-position-embeddings 1024 \
-    --make-vocab-size-divisible-by 16032 \
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
     --tokenizer-type NullTokenizer \
@@ -76,13 +79,13 @@ DATA_ARGS="
 
 OUTPUT_ARGS="
     --log-interval 1 \
-    --save-interval 20 \
+    --save-interval 10000 \
     --eval-interval 10000 \
     --eval-iters 10 \
 "
 
 CKPT_SAVE_DIR="/home/l00618052/Megatron-LM/ckpt"
-CKPT_LOAD_DIR="/home/l00618052/Megatron-LM/ckpt/iter_0000005"
+CKPT_LOAD_DIR="/home/l00618052/Megatron-LM/my_model_state_dict_rename_adapt_tp.pth"
 
 torchrun $DISTRIBUTED_ARGS pretrain_opensora.py /home/l00618052/Megatron-LM/16x256x256.py \
     $GPT_ARGS \
@@ -90,6 +93,7 @@ torchrun $DISTRIBUTED_ARGS pretrain_opensora.py /home/l00618052/Megatron-LM/16x2
     $OUTPUT_ARGS \
     --distributed-backend nccl \
     --save ${CKPT_SAVE_DIR} \
+    --train-iters 2000 \
     --load ${CKPT_LOAD_DIR}
 
 

@@ -1311,6 +1311,8 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     group.add_argument('--context-parallel-size', type=int, default=1,
                        help='Degree of context parallelism.')
+    group.add_argument('--enable-preprocessing-data-parallelism', type=bool, required=False, default=False,
+                       help='whether enable preprocessing data parallelism.')
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
                        help='Path to the yaml file with NCCL communicator '
                        'configurations. The number of min/max thread groups and thread '
